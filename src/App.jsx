@@ -54,7 +54,7 @@ async function askClaude(prompt, images) {
     });
   }
   content.push({ type: "text", text: prompt });
-  const response = await fetch("/api/claude", {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -236,24 +236,32 @@ function compositeMockup(shirt, logo, pos, scale, cfg) {
     }
   }
 
-  // recolor invisible ink: shift pixels near cfg.recolor.from toward
-  // cfg.recolor.to, preserving luminance so anti-aliasing stays smooth
-  if (cfg.recolor && cfg.recolor.on) {
+  // colorway remap: apply all swaps in ONE pass against the original pixel
+  // values (so pink->white and white->black can't cascade into each other).
+  // Each pixel is matched to its nearest "from" color; luminance is preserved
+  // so anti-aliased edges stay smooth.
+  if (cfg.swaps && cfg.swaps.length > 0) {
     const rid = lctx.getImageData(0, 0, lw, lh);
     const p2 = rid.data;
-    const [fr, fg, fb] = hexToRgb(cfg.recolor.from || "#ffffff");
-    const [tr, tg, tb] = hexToRgb(cfg.recolor.to || "#333333");
-    const fromLum = Math.max(30, 0.299 * fr + 0.587 * fg + 0.114 * fb);
+    const table = cfg.swaps.map((sw) => {
+      const [fr, fg, fb] = hexToRgb(sw.from || "#ffffff");
+      const [tr, tg, tb] = hexToRgb(sw.to || "#333333");
+      return { fr, fg, fb, tr, tg, tb, fromLum: Math.max(30, 0.299 * fr + 0.587 * fg + 0.114 * fb) };
+    });
     for (let i = 0; i < p2.length; i += 4) {
       if (p2[i + 3] < 8) continue;
-      const d = Math.sqrt((p2[i] - fr) ** 2 + (p2[i + 1] - fg) ** 2 + (p2[i + 2] - fb) ** 2);
-      const f = d < 60 ? 1 : d < 110 ? 1 - (d - 60) / 50 : 0;
-      if (f <= 0) continue;
+      let best = null, bestD = Infinity;
+      for (const t of table) {
+        const d = Math.sqrt((p2[i] - t.fr) ** 2 + (p2[i + 1] - t.fg) ** 2 + (p2[i + 2] - t.fb) ** 2);
+        if (d < bestD) { bestD = d; best = t; }
+      }
+      const f = bestD < 60 ? 1 : bestD < 110 ? 1 - (bestD - 60) / 50 : 0;
+      if (f <= 0 || !best) continue;
       const l = 0.299 * p2[i] + 0.587 * p2[i + 1] + 0.114 * p2[i + 2];
-      const ratio = Math.min(1.25, l / fromLum);
-      p2[i]     = p2[i]     * (1 - f) + Math.min(255, tr * ratio) * f;
-      p2[i + 1] = p2[i + 1] * (1 - f) + Math.min(255, tg * ratio) * f;
-      p2[i + 2] = p2[i + 2] * (1 - f) + Math.min(255, tb * ratio) * f;
+      const ratio = Math.min(1.25, l / best.fromLum);
+      p2[i]     = p2[i]     * (1 - f) + Math.min(255, best.tr * ratio) * f;
+      p2[i + 1] = p2[i + 1] * (1 - f) + Math.min(255, best.tg * ratio) * f;
+      p2[i + 2] = p2[i + 2] * (1 - f) + Math.min(255, best.tb * ratio) * f;
     }
     lctx.putImageData(rid, 0, 0);
   }
@@ -345,14 +353,14 @@ function LogoBlender() {
   const [mode, setMode] = useState("print");
   const [bgKey, setBgKey] = useState(25);
   const [panel, setPanel] = useState({ on: false, hex: "#d6246e" });
-  const [recolor, setRecolor] = useState({ on: false, from: "#ffffff", to: "#c4256b" });
+  const [swaps, setSwaps] = useState([]); // [{from, to}] colorway remap
   const [fabric, setFabric] = useState(null);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNote, setAiNote] = useState(null);
   const canvasRef = useRef(null);
   const dragging = useRef(false);
 
-  const cfg = { fade, adapt, mode, bgKey, panel, recolor };
+  const cfg = { fade, adapt, mode, bgKey, panel, swaps };
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -367,7 +375,7 @@ function LogoBlender() {
     canvas.width = out.canvas.width; canvas.height = out.canvas.height;
     canvas.getContext("2d").drawImage(out.canvas, 0, 0);
     setFabric(out.fabric);
-  }, [shirt, logo, pos, scale, fade, adapt, mode, bgKey, panel, recolor]);
+  }, [shirt, logo, pos, scale, fade, adapt, mode, bgKey, panel, swaps]);
 
   useEffect(() => { render(); }, [render]);
 
@@ -378,7 +386,7 @@ function LogoBlender() {
     setAiBusy(true); setAiNote("Analyzing design…");
     try {
       const logoB64 = imageToBase64(logo, 512);
-      const probe = compositeMockup(shirt, logo, pos, scale, { ...cfg, bgKey: 0, panel: { on: false, hex: panel.hex }, recolor: { on: false } });
+      const probe = compositeMockup(shirt, logo, pos, scale, { ...cfg, bgKey: 0, panel: { on: false, hex: panel.hex }, swaps: [] });
       const fab = probe.fabric;
 
       // step 1: propose
@@ -387,24 +395,24 @@ function LogoBlender() {
 
 Every element of the design must remain visible on that fabric, and the result should look like it belongs on this shirt.
 
-Your tools, in order of preference:
-1. bgRemoval: strip an incidental backdrop (0 = keep the design's own background).
-2. recolor: if some ink would be invisible against this fabric (e.g. white text on a white shirt), recolor exactly that ink: "from" = the invisible color, "to" = a replacement that clearly contrasts the fabric AND harmonizes with the design's own palette (prefer a color already present in the design, like an outline or accent color).
-3. addPanel: only as a last resort for complex multi-tone designs that recoloring would ruin.
+Your main tool is a COLORWAY REMAP: a list of color swaps applied to the design so it sits naturally on this specific shirt. Think like a print designer adapting artwork per garment color. Examples of the kind of remap expected:
+- Design has a pink background panel + white text, shirt is white -> swap pink to the shirt's white (the panel melts into the shirt) and swap white text to black (or another dark ink from the design's world) so it reads clearly.
+- Same design on a black shirt -> maybe keep the pink, swap nothing, or swap dark elements to white.
+List every color in the design that needs to change: colors too close to the fabric get remapped to contrasting ink; background panels can be remapped to the fabric color itself so the design fades into the shirt.
+
+Other tools: bgRemoval strips an incidental backdrop entirely (0 = keep); addPanel adds a solid backing panel (last resort only).
 
 Respond ONLY with valid JSON, no markdown:
-{"bgRemoval": 0-60, "recolor": {"on": true|false, "from": "#RRGGBB", "to": "#RRGGBB"}, "addPanel": true|false, "panelHex": "#RRGGBB or null", "note": "one short sentence"}`,
+{"bgRemoval": 0-60, "swaps": [up to 4 of {"from": "#RRGGBB", "to": "#RRGGBB"}], "addPanel": true|false, "panelHex": "#RRGGBB or null", "note": "one short sentence describing the remap"}`,
         logoB64
       );
       let trial = {
         fade: 95, adapt: 0, mode: "print",
         bgKey: Math.max(0, Math.min(60, Number(prop.bgRemoval) || 0)),
         panel: { on: !!prop.addPanel, hex: prop.panelHex || "#d6246e" },
-        recolor: {
-          on: !!prop.recolor?.on,
-          from: prop.recolor?.from || "#ffffff",
-          to: prop.recolor?.to || "#c4256b",
-        },
+        swaps: Array.isArray(prop.swaps)
+          ? prop.swaps.slice(0, 4).filter((sw) => sw?.from && sw?.to)
+          : [],
       };
       let note = prop.note || "";
 
@@ -419,9 +427,9 @@ Respond ONLY with valid JSON, no markdown:
 Judge ONLY visibility and crispness: is EVERY element of the original design (all text, outlines, artwork) clearly visible and readable in the mockup, with no invisible, ghosted, or fringed parts?
 
 Respond ONLY with valid JSON, no markdown:
-{"ok": true|false, "problem": "short description or null", "fix": {"bgRemoval": 0-60, "recolor": {"on": true|false, "from": "#RRGGBB", "to": "#RRGGBB"}, "addPanel": true|false, "panelHex": "#RRGGBB or null"}, "note": "one short sentence"}
+{"ok": true|false, "problem": "short description or null", "fix": {"bgRemoval": 0-60, "swaps": [up to 4 of {"from": "#RRGGBB", "to": "#RRGGBB"}], "addPanel": true|false, "panelHex": "#RRGGBB or null"}, "note": "one short sentence"}
 
-If any element is invisible or barely readable (e.g. white text on white fabric), ok must be false. Prefer fix.recolor: set "from" to the invisible ink's color and "to" to a color that clearly contrasts the fabric and harmonizes with the design's palette. Use fix.addPanel only if recoloring would ruin the design.`,
+Judge like a print designer: the design should sit naturally on the fabric (background panels may melt into the shirt color) with all text and artwork clearly readable. If anything is invisible or barely readable, ok must be false and fix.swaps must be the COMPLETE remap list (all swaps, not a delta): swap invisible ink to a contrasting color that suits the design, and optionally swap the design's background to the fabric color so it fades into the shirt. Use fix.addPanel only if a remap would ruin the design.`,
           [logoB64, cropB64]
         );
         note = check.note || note;
@@ -433,17 +441,15 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
             on: !!check.fix?.addPanel,
             hex: check.fix?.panelHex || trial.panel.hex,
           },
-          recolor: {
-            on: !!check.fix?.recolor?.on,
-            from: check.fix?.recolor?.from || trial.recolor.from,
-            to: check.fix?.recolor?.to || trial.recolor.to,
-          },
+          swaps: Array.isArray(check.fix?.swaps)
+            ? check.fix.swaps.slice(0, 4).filter((sw) => sw?.from && sw?.to)
+            : trial.swaps,
         };
       }
 
       setBgKey(trial.bgKey);
       setPanel(trial.panel);
-      setRecolor(trial.recolor);
+      setSwaps(trial.swaps);
       setMode("print"); setAdapt(0); setFade(95);
       setAiNote(note || "Settings applied.");
     } catch (e) {
@@ -474,7 +480,7 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
         <button onClick={autoFit} disabled={!shirt || !logo || aiBusy}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: shirt && logo && !aiBusy ? T.cyan : T.line, color: "#fff" }}>
-          {aiBusy ? "Working…" : "✦ AI auto-fit (checks its own result)"}
+          {aiBusy ? "Working…" : "✦ AI auto-fit"}
         </button>
         {aiNote && (
           <div className="text-xs rounded p-2" style={{ fontFamily: mono, color: T.inkSoft, background: T.card, border: `1px solid ${T.line}` }}>
@@ -496,21 +502,30 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
               onChange={(e) => setPanel({ ...panel, hex: e.target.value })}
               style={{ width: 34, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: panel.on ? 1 : 0.4 }} />
           </div>
-          <div className="flex items-center justify-between">
-            <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ fontFamily: mono, color: T.inkSoft }}>
-              <input type="checkbox" checked={recolor.on} style={{ accentColor: T.magenta }}
-                onChange={(e) => setRecolor({ ...recolor, on: e.target.checked })} />
-              INK RECOLOR
-            </label>
-            <div className="flex items-center gap-1">
-              <input type="color" value={recolor.from} disabled={!recolor.on}
-                onChange={(e) => setRecolor({ ...recolor, from: e.target.value })}
-                style={{ width: 28, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: recolor.on ? 1 : 0.4 }} />
-              <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>→</span>
-              <input type="color" value={recolor.to} disabled={!recolor.on}
-                onChange={(e) => setRecolor({ ...recolor, to: e.target.value })}
-                style={{ width: 28, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: recolor.on ? 1 : 0.4 }} />
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>COLOR SWAPS</span>
+              <button onClick={() => setSwaps([...swaps, { from: "#ffffff", to: "#111111" }])}
+                disabled={swaps.length >= 4}
+                className="px-2 py-0.5 rounded text-xs"
+                style={{ fontFamily: mono, border: `1px solid ${T.line}`, color: swaps.length >= 4 ? T.line : T.inkSoft }}>
+                + add
+              </button>
             </div>
+            {swaps.map((sw, i) => (
+              <div key={i} className="flex items-center gap-1.5">
+                <input type="color" value={sw.from}
+                  onChange={(e) => setSwaps(swaps.map((x, j) => j === i ? { ...x, from: e.target.value } : x))}
+                  style={{ width: 28, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent" }} />
+                <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>→</span>
+                <input type="color" value={sw.to}
+                  onChange={(e) => setSwaps(swaps.map((x, j) => j === i ? { ...x, to: e.target.value } : x))}
+                  style={{ width: 28, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent" }} />
+                <span className="text-xs flex-1" style={{ fontFamily: mono, color: T.inkSoft }}>{sw.from} → {sw.to}</span>
+                <button onClick={() => setSwaps(swaps.filter((_, j) => j !== i))}
+                  className="text-xs px-1" style={{ fontFamily: mono, color: T.bad }}>✕</button>
+              </div>
+            ))}
           </div>
           <div>
             <div className="text-xs mb-1" style={{ fontFamily: mono, color: T.inkSoft }}>BLEND MODE</div>
@@ -563,7 +578,7 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
           )}
         </div>
         <p className="text-xs mt-2" style={{ color: T.inkSoft }}>
-          Auto-fit verifies its own work: it composites the mockup, inspects the result against the original design, and corrects — preferring to recolor invisible ink into a shade that matches the shirt and the design's own palette, with a backing panel only as a last resort.
+          Auto-fit works like a print designer: it builds a colorway remap for this specific shirt (e.g. pink panel → shirt white so it fades into the fabric, white text → black so it reads), renders it, inspects its own result, and corrects until everything is visible. The swap list it chose appears above — edit any swap manually.
         </p>
       </div>
     </div>
@@ -728,7 +743,7 @@ Rules:
         <button onClick={analyze} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.cyan : T.line, color: "#fff" }}>
-          {loading ? "Generating…" : "Generate 5 template options"}
+          {loading ? "Generating…" : "Generate template options"}
         </button>
         {spec && (
           <>
@@ -862,7 +877,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
         <button onClick={check} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.ink : T.line, color: "#fff" }}>
-          {loading ? "Screening…" : "Run IP screen"}
+          {loading ? "Screening…" : "Run Copyright Screen"}
         </button>
         {error && <div className="text-sm" style={{ color: T.bad }}>{error}</div>}
       </div>
@@ -915,7 +930,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
 const TABS = [
   { id: "blend", label: "Logo Blender", chip: T.magenta, sub: "fade a logo into fabric" },
   { id: "template", label: "Template Extractor", chip: T.cyan, sub: "strip a sample into a reusable form" },
-  { id: "ip", label: "Copyright Screen", chip: T.yellowChip, sub: "flag copyrighted logos" },
+  { id: "ip", label: "IP Screen", chip: T.yellowChip, sub: "flag copyrighted logos" },
 ];
 
 export default function App() {
@@ -926,8 +941,8 @@ export default function App() {
       <header className="px-6 pt-6 pb-4" style={{ borderBottom: `1px solid ${T.line}` }}>
         <div className="flex items-baseline gap-3">
           <span style={{ fontFamily: mono, fontSize: 18, color: T.magenta }}>⊕</span>
-          <h1 className="text-xl font-semibold tracking-tight">InkWells</h1>
-          <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>logo blend · templates · copyright screen</span>
+          <h1 className="text-xl font-semibold tracking-tight">Print Studio</h1>
+          <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>logo blend · templates · ip screen</span>
         </div>
         <nav className="flex gap-2 mt-4 flex-wrap">
           {TABS.map((t) => (
