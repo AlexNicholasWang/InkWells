@@ -496,7 +496,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
         <button onClick={check} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.ink : T.line, color: "#fff" }}>
-          {loading ? "Screening…" : "Run IP screen"}
+          {loading ? "Screening…" : "Run Copyright Screen"}
         </button>
         {error && <div className="text-sm" style={{ color: T.bad }}>{error}</div>}
       </div>
