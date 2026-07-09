@@ -340,36 +340,145 @@ function LogoBlender() {
 }
 
 // ---------- Module 2: Template Extractor ----------
+function hexToRgb(hex) {
+  const h = hex.replace("#", "");
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
 function TemplateExtractor() {
   const [img, setImg] = useState(null);
   const [dataUrl, setDataUrl] = useState(null);
   const [spec, setSpec] = useState(null);
+  const [variants, setVariants] = useState([]);
+  const [showZones, setShowZones] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
+  // Fill each strip zone with fabric sampled from a ring just outside it,
+  // blurred so the patch melts into the garment.
+  const buildBlank = (image, zones) => {
+    const W = Math.min(900, image.width);
+    const H = Math.round(W * (image.height / image.width));
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(image, 0, 0, W, H);
+
+    for (const z of zones.filter((z) => z.strip)) {
+      const pad = Math.round(W * 0.012) + 2;
+      const zx = Math.max(0, Math.round((z.x / 100) * W) - pad);
+      const zy = Math.max(0, Math.round((z.y / 100) * H) - pad);
+      const zw = Math.min(W - zx, Math.round((z.w / 100) * W) + pad * 2);
+      const zh = Math.min(H - zy, Math.round((z.h / 100) * H) + pad * 2);
+      if (zw < 4 || zh < 4) continue;
+
+      // sample thin bands above and below the zone for a vertical gradient
+      const band = Math.max(2, Math.round(H * 0.008));
+      const avg = (bx, by, bw, bh) => {
+        const x = Math.max(0, bx), y = Math.max(0, by);
+        const w = Math.min(W - x, bw) || 1, h = Math.min(H - y, bh) || 1;
+        const d = ctx.getImageData(x, y, w, h).data;
+        let r = 0, g = 0, b = 0, n = 0;
+        for (let i = 0; i < d.length; i += 8) { r += d[i]; g += d[i + 1]; b += d[i + 2]; n++; }
+        return [r / n, g / n, b / n];
+      };
+      const top = avg(zx, zy - band - 1, zw, band);
+      const bot = avg(zx, zy + zh + 1, zw, band);
+
+      const patch = document.createElement("canvas");
+      patch.width = zw; patch.height = zh;
+      const pctx = patch.getContext("2d");
+      const grad = pctx.createLinearGradient(0, 0, 0, zh);
+      grad.addColorStop(0, `rgb(${top.map(Math.round).join(",")})`);
+      grad.addColorStop(1, `rgb(${bot.map(Math.round).join(",")})`);
+      pctx.fillStyle = grad;
+      pctx.fillRect(0, 0, zw, zh);
+      // faint noise so the patch doesn't look plastic-flat
+      const nid = pctx.getImageData(0, 0, zw, zh);
+      for (let i = 0; i < nid.data.length; i += 4) {
+        const nz = (Math.random() - 0.5) * 6;
+        nid.data[i] += nz; nid.data[i + 1] += nz; nid.data[i + 2] += nz;
+      }
+      pctx.putImageData(nid, 0, 0);
+
+      ctx.save();
+      ctx.filter = "blur(2px)";
+      ctx.drawImage(patch, zx, zy, zw, zh);
+      ctx.restore();
+    }
+    return c;
+  };
+
+  // Luminance-preserving recolor of pixels near the garment's body color.
+  const recolor = (blank, bodyHex, targetHex) => {
+    const c = document.createElement("canvas");
+    c.width = blank.width; c.height = blank.height;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(blank, 0, 0);
+    const id = ctx.getImageData(0, 0, c.width, c.height);
+    const px = id.data;
+    const [br, bg2, bb] = hexToRgb(bodyHex);
+    const [tr, tg, tb] = hexToRgb(targetHex);
+    const bodyLum = Math.max(30, 0.299 * br + 0.587 * bg2 + 0.114 * bb);
+    for (let i = 0; i < px.length; i += 4) {
+      const d = Math.sqrt((px[i] - br) ** 2 + (px[i + 1] - bg2) ** 2 + (px[i + 2] - bb) ** 2);
+      let f = d < 70 ? 1 : d < 130 ? 1 - (d - 70) / 60 : 0;
+      if (f <= 0) continue;
+      const lum = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      const ratio = Math.min(1.35, lum / bodyLum);
+      px[i]     = px[i]     * (1 - f) + Math.min(255, tr * ratio) * f;
+      px[i + 1] = px[i + 1] * (1 - f) + Math.min(255, tg * ratio) * f;
+      px[i + 2] = px[i + 2] * (1 - f) + Math.min(255, tb * ratio) * f;
+    }
+    ctx.putImageData(id, 0, 0);
+    return c;
+  };
+
   const analyze = async () => {
-    setLoading(true); setError(null); setSpec(null);
+    setLoading(true); setError(null); setSpec(null); setVariants([]);
     try {
       const b64 = imageToBase64(img);
       const result = await askClaude(
-        `You are analyzing a garment photo for a print shop that wants to turn it into a reusable design template. Identify the base garment and separate STRUCTURE (keep) from DESIGN CONTENT (strip out and replace per customer).
+        `You are analyzing a garment photo for a print shop that turns samples into reusable design templates. Separate STRUCTURE (keep) from DESIGN CONTENT (strip and replace per customer).
 
 Respond ONLY with valid JSON, no markdown, matching exactly:
 {
  "garmentType": "string",
  "baseColors": [{"name":"string","hex":"#RRGGBB","role":"body|trim|accent"}],
  "designElements": [{"element":"string","location":"string","strip":true|false,"why":"string"}],
- "templateZones": [{"zone":"string","x":0-100,"y":0-100,"w":0-100,"h":0-100,"purpose":"string"}],
+ "templateZones": [{"zone":"string","x":0-100,"y":0-100,"w":0-100,"h":0-100,"purpose":"string","strip":true|false}],
+ "colorways": [exactly 4 of {"name":"string","bodyHex":"#RRGGBB"}],
  "styleNotes": "one sentence on the visual language to preserve"
 }
-templateZones coordinates are percentages of the image (x,y = top-left of zone). Include zones like crest, sponsor, number, sleeve badge, stripe bands as applicable.`,
+Rules:
+- templateZones x,y = top-left corner as percent of image; make strip zones TIGHT around the removable design content only (logos, crests, sponsor text, numbers), never covering seams/collar/structure.
+- Mark strip:true only for zones containing removable design content.
+- colorways: 4 alternative body colors that suit this garment type (do not include the original color).`,
         b64
       );
       setSpec(result);
+
+      // build the clean blank + colorway variants
+      const blank = buildBlank(img, result.templateZones || []);
+      const bodyHex = (result.baseColors || []).find((c) => c.role === "body")?.hex || "#ffffff";
+      const out = [{ name: "Original (stripped)", hex: bodyHex, url: blank.toDataURL("image/png") }];
+      for (const cw of (result.colorways || []).slice(0, 4)) {
+        try {
+          out.push({ name: cw.name, hex: cw.bodyHex, url: recolor(blank, bodyHex, cw.bodyHex).toDataURL("image/png") });
+        } catch (e) { /* skip bad colorway */ }
+      }
+      setVariants(out);
     } catch (e) {
       setError("Analysis failed — try again or use a clearer photo.");
     }
     setLoading(false);
+  };
+
+  const downloadVariant = (v) => {
+    const a = document.createElement("a");
+    a.download = `template-${v.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.png`;
+    a.href = v.url;
+    a.click();
   };
 
   const downloadSpec = () => {
@@ -384,69 +493,95 @@ templateZones coordinates are percentages of the image (x,y = top-left of zone).
     <div className="grid gap-5 md:grid-cols-3">
       <div className="space-y-4">
         <Drop label="Sample garment (e.g. jersey)"
-          onFile={(image, url) => { setImg(image); setDataUrl(url); setSpec(null); }} />
+          onFile={(image, url) => { setImg(image); setDataUrl(url); setSpec(null); setVariants([]); }} />
         <button onClick={analyze} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.cyan : T.line, color: "#fff" }}>
-          {loading ? "Analyzing…" : "Extract template"}
+          {loading ? "Generating…" : "Generate 5 template options"}
         </button>
         {spec && (
-          <button onClick={downloadSpec} className="w-full py-2 rounded text-sm"
-            style={{ border: `1px solid ${T.ink}`, color: T.ink }}>
-            Download spec JSON
-          </button>
+          <>
+            <button onClick={() => setShowZones(!showZones)} className="w-full py-2 rounded text-sm"
+              style={{ border: `1px solid ${T.line}`, color: T.inkSoft }}>
+              {showZones ? "Hide" : "Show"} zone overlay
+            </button>
+            <button onClick={downloadSpec} className="w-full py-2 rounded text-sm"
+              style={{ border: `1px solid ${T.ink}`, color: T.ink }}>
+              Download spec JSON
+            </button>
+          </>
         )}
         {error && <div className="text-sm" style={{ color: T.bad }}>{error}</div>}
       </div>
 
       <div className="md:col-span-2 space-y-4">
-        {loading && <Spinner text="Reading the garment: structure vs. design content…" />}
+        {loading && <Spinner text="Stripping design content and building colorways…" />}
         {!spec && !loading && (
           <div className="rounded-lg p-6 text-sm" style={{ background: T.card, border: `1px solid ${T.line}`, color: T.inkSoft }}>
-            Upload a reference garment and the analyzer returns a reusable template: base colors, placement zones (crest, sponsor, number…), and which elements to strip so new designs keep the original's form.
+            Upload a reference garment. The design content (crests, sponsors, numbers) gets stripped out and you get 5 ready-to-use template options — the cleaned original plus 4 alternative colorways — each downloadable as PNG.
           </div>
         )}
+
+        {variants.length > 0 && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {variants.map((v, i) => (
+              <button key={i} onClick={() => downloadVariant(v)}
+                className="rounded-lg overflow-hidden text-left group"
+                style={{ border: `1px solid ${T.line}`, background: T.card }}>
+                <img src={v.url} alt={v.name} className="w-full block" />
+                <div className="px-2 py-1.5 flex items-center gap-2">
+                  <span style={{ width: 12, height: 12, background: v.hex, border: `1px solid ${T.line}`, borderRadius: 3, display: "inline-block" }} />
+                  <span className="text-xs font-medium truncate" style={{ color: T.ink }}>{v.name}</span>
+                </div>
+                <div className="px-2 pb-1.5 text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>click to download</div>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {spec && showZones && (
+          <div className="relative rounded-lg overflow-hidden" style={{ border: `1px solid ${T.line}` }}>
+            <img src={dataUrl} alt="garment" className="w-full block" />
+            {spec.templateZones?.map((z, i) => (
+              <div key={i} className="absolute"
+                style={{
+                  left: `${z.x}%`, top: `${z.y}%`, width: `${z.w}%`, height: `${z.h}%`,
+                  border: `2px solid ${z.strip ? T.bad : T.cyan}`,
+                  background: z.strip ? "rgba(197,48,48,0.08)" : "rgba(14,140,168,0.06)",
+                }}>
+                <span className="px-1" style={{ fontFamily: mono, fontSize: 10, background: z.strip ? T.bad : T.cyan, color: "#fff" }}>
+                  {z.zone}{z.strip ? " · strip" : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
         {spec && (
-          <>
-            <div className="relative rounded-lg overflow-hidden" style={{ border: `1px solid ${T.line}` }}>
-              <img src={dataUrl} alt="garment" className="w-full block" />
-              {spec.templateZones?.map((z, i) => (
-                <div key={i} className="absolute flex items-start justify-start"
-                  style={{
-                    left: `${z.x}%`, top: `${z.y}%`, width: `${z.w}%`, height: `${z.h}%`,
-                    border: `2px solid ${T.magenta}`, background: "rgba(196,37,107,0.08)",
-                  }}>
-                  <span className="px-1" style={{ fontFamily: mono, fontSize: 10, background: T.magenta, color: "#fff" }}>
-                    {z.zone}
-                  </span>
-                </div>
-              ))}
-            </div>
-            <div className="rounded-lg p-4 space-y-4" style={{ background: T.card, border: `1px solid ${T.line}` }}>
-              <div>
-                <div className="text-xs mb-2" style={{ fontFamily: mono, color: T.inkSoft }}>BASE COLORS — {spec.garmentType}</div>
-                <div className="flex flex-wrap gap-2">
-                  {spec.baseColors?.map((c, i) => <Chip key={i} hex={c.hex} name={`${c.name} · ${c.role}`} />)}
-                </div>
+          <div className="rounded-lg p-4 space-y-4" style={{ background: T.card, border: `1px solid ${T.line}` }}>
+            <div>
+              <div className="text-xs mb-2" style={{ fontFamily: mono, color: T.inkSoft }}>BASE COLORS — {spec.garmentType}</div>
+              <div className="flex flex-wrap gap-2">
+                {spec.baseColors?.map((c, i) => <Chip key={i} hex={c.hex} name={`${c.name} · ${c.role}`} />)}
               </div>
-              <div>
-                <div className="text-xs mb-2" style={{ fontFamily: mono, color: T.inkSoft }}>DESIGN ELEMENTS</div>
-                <div className="space-y-1.5">
-                  {spec.designElements?.map((d, i) => (
-                    <div key={i} className="flex items-start gap-2 text-sm" style={{ color: T.ink }}>
-                      <span className="px-1.5 rounded text-xs mt-0.5" style={{
-                        fontFamily: mono,
-                        background: d.strip ? "#FDECEC" : "#EAF5EE",
-                        color: d.strip ? T.bad : T.ok,
-                      }}>{d.strip ? "STRIP" : "KEEP"}</span>
-                      <span><strong>{d.element}</strong> — {d.location}. <span style={{ color: T.inkSoft }}>{d.why}</span></span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <p className="text-sm italic" style={{ color: T.inkSoft }}>{spec.styleNotes}</p>
             </div>
-          </>
+            <div>
+              <div className="text-xs mb-2" style={{ fontFamily: mono, color: T.inkSoft }}>DESIGN ELEMENTS</div>
+              <div className="space-y-1.5">
+                {spec.designElements?.map((d, i) => (
+                  <div key={i} className="flex items-start gap-2 text-sm" style={{ color: T.ink }}>
+                    <span className="px-1.5 rounded text-xs mt-0.5" style={{
+                      fontFamily: mono,
+                      background: d.strip ? "#FDECEC" : "#EAF5EE",
+                      color: d.strip ? T.bad : T.ok,
+                    }}>{d.strip ? "STRIP" : "KEEP"}</span>
+                    <span><strong>{d.element}</strong> — {d.location}. <span style={{ color: T.inkSoft }}>{d.why}</span></span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <p className="text-sm italic" style={{ color: T.inkSoft }}>{spec.styleNotes}</p>
+          </div>
         )}
       </div>
     </div>
@@ -496,7 +631,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
         <button onClick={check} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.ink : T.line, color: "#fff" }}>
-          {loading ? "Screening…" : "Run Copyright Screen"}
+          {loading ? "Screening…" : "Run IP screen"}
         </button>
         {error && <div className="text-sm" style={{ color: T.bad }}>{error}</div>}
       </div>
