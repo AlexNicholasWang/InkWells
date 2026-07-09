@@ -941,7 +941,7 @@ export default function App() {
       <header className="px-6 pt-6 pb-4" style={{ borderBottom: `1px solid ${T.line}` }}>
         <div className="flex items-baseline gap-3">
           <span style={{ fontFamily: mono, fontSize: 18, color: T.magenta }}>⊕</span>
-          <h1 className="text-xl font-semibold tracking-tight">Print Studio</h1>
+          <h1 className="text-xl font-semibold tracking-tight">InkWells</h1>
           <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>logo blend · templates · ip screen</span>
         </div>
         <nav className="flex gap-2 mt-4 flex-wrap">
