@@ -549,7 +549,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
 const TABS = [
   { id: "blend", label: "Logo Blender", chip: T.magenta, sub: "fade a logo into fabric" },
   { id: "template", label: "Template Extractor", chip: T.cyan, sub: "strip a sample into a reusable form" },
-  { id: "ip", label: "IP Screen", chip: T.yellowChip, sub: "flag copyrighted logos" },
+  { id: "ip", label: "Copyright Screen", chip: T.yellowChip, sub: "flag copyrighted logos" },
 ];
 
 export default function App() {
@@ -561,7 +561,7 @@ export default function App() {
         <div className="flex items-baseline gap-3">
           <span style={{ fontFamily: mono, fontSize: 18, color: T.magenta }}>⊕</span>
           <h1 className="text-xl font-semibold tracking-tight">Print Studio</h1>
-          <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>logo blend · templates · ip screen</span>
+          <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>logo blend · templates · copyright screen</span>
         </div>
         <nav className="flex gap-2 mt-4 flex-wrap">
           {TABS.map((t) => (
