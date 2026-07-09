@@ -1,4 +1,4 @@
-# Print Studio
+# InkWells
 
 Logo blending, template extraction, and IP screening for custom apparel.
 
