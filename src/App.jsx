@@ -44,12 +44,13 @@ function imageToBase64(img, maxDim = 1024) {
   return dataUrl.split(",")[1];
 }
 
-async function askClaude(prompt, base64Png) {
+async function askClaude(prompt, images) {
   const content = [];
-  if (base64Png) {
+  const arr = Array.isArray(images) ? images : images ? [images] : [];
+  for (const b64 of arr) {
     content.push({
       type: "image",
-      source: { type: "base64", media_type: "image/png", data: base64Png },
+      source: { type: "base64", media_type: "image/png", data: b64 },
     });
   }
   content.push({ type: "text", text: prompt });
@@ -63,12 +64,20 @@ async function askClaude(prompt, base64Png) {
     }),
   });
   const data = await response.json();
-  const text = data.content
+  if (!response.ok || data.error) {
+    const msg = data?.error?.message || data?.error || `API error (HTTP ${response.status})`;
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
+  const text = (data.content || [])
     .filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("\n");
   const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    throw new Error("AI returned an unparseable response — try again");
+  }
 }
 
 // ---------- shared UI ----------
@@ -157,105 +166,252 @@ function Spinner({ text }) {
 }
 
 // ---------- Module 1: Logo Blender ----------
+// Pure compositor: renders shirt + logo with the given config into a canvas.
+// Used by both the live preview and the AI agent's trial renders.
+function compositeMockup(shirt, logo, pos, scale, cfg) {
+  const CW = 640;
+  const CH = Math.round(CW * (shirt.height / shirt.width));
+  const canvas = document.createElement("canvas");
+  canvas.width = CW; canvas.height = CH;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(shirt, 0, 0, CW, CH);
+
+  const lw = Math.max(2, Math.round((scale / 100) * CW));
+  const lh = Math.max(2, Math.round(lw * (logo.height / logo.width)));
+  const pp = cfg.panel.on ? Math.round(lw * 0.1) : 0;
+  const ow = lw + pp * 2, oh = lh + pp * 2;
+  const ox = pos.x * CW - ow / 2;
+  const oy = pos.y * CH - oh / 2;
+
+  const sx = Math.max(0, Math.round(ox)), sy = Math.max(0, Math.round(oy));
+  const sw = Math.min(CW - sx, ow) || 1;
+  const sh = Math.min(CH - sy, oh) || 1;
+  const data = ctx.getImageData(sx, sy, sw, sh).data;
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < data.length; i += 16) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+  r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
+  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+  const fabric = {
+    hex: "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join(""),
+    lum: Math.round(lum),
+  };
+
+  // key the logo's background with de-fringing
+  const logoC = document.createElement("canvas");
+  logoC.width = lw; logoC.height = lh;
+  const lctx = logoC.getContext("2d");
+  lctx.drawImage(logo, 0, 0, lw, lh);
+  if (cfg.bgKey > 0) {
+    const id = lctx.getImageData(0, 0, lw, lh);
+    const px = id.data;
+    let br = 0, bg2 = 0, bb = 0, bn = 0;
+    const patch = Math.max(1, Math.floor(Math.min(lw, lh) * 0.04));
+    const corners = [[0, 0], [lw - patch, 0], [0, lh - patch], [lw - patch, lh - patch]];
+    for (const [cx0, cy0] of corners) {
+      for (let y = cy0; y < cy0 + patch; y++) {
+        for (let x = cx0; x < cx0 + patch; x++) {
+          const i = (y * lw + x) * 4;
+          if (px[i + 3] < 10) continue;
+          br += px[i]; bg2 += px[i + 1]; bb += px[i + 2]; bn++;
+        }
+      }
+    }
+    if (bn > 0) {
+      br /= bn; bg2 /= bn; bb /= bn;
+      const tol = cfg.bgKey * 1.8;
+      const soft = tol * 1.7;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i + 3] === 0) continue;
+        const d = Math.sqrt((px[i] - br) ** 2 + (px[i + 1] - bg2) ** 2 + (px[i + 2] - bb) ** 2);
+        if (d < tol) { px[i + 3] = 0; continue; }
+        if (d < soft) {
+          const f = (d - tol) / (soft - tol);
+          px[i + 3] = Math.round(px[i + 3] * f);
+          px[i]     = Math.min(255, Math.max(0, (px[i]     - br  * (1 - f)) / f));
+          px[i + 1] = Math.min(255, Math.max(0, (px[i + 1] - bg2 * (1 - f)) / f));
+          px[i + 2] = Math.min(255, Math.max(0, (px[i + 2] - bb  * (1 - f)) / f));
+        }
+      }
+      lctx.putImageData(id, 0, 0);
+    }
+  }
+
+  // compose backing panel + logo
+  const off = document.createElement("canvas");
+  off.width = ow; off.height = oh;
+  const octx = off.getContext("2d");
+  if (cfg.panel.on) {
+    octx.fillStyle = cfg.panel.hex;
+    if (typeof octx.roundRect === "function") {
+      octx.beginPath();
+      octx.roundRect(0, 0, ow, oh, Math.max(2, Math.round(pp * 0.7)));
+      octx.fill();
+    } else {
+      octx.fillRect(0, 0, ow, oh);
+    }
+  }
+  octx.drawImage(logoC, pp, pp);
+  if (cfg.adapt > 0) {
+    octx.globalCompositeOperation = "source-atop";
+    octx.fillStyle = `rgba(${r},${g},${b},${cfg.adapt / 100})`;
+    octx.fillRect(0, 0, ow, oh);
+    octx.globalCompositeOperation = "source-over";
+  }
+
+  let blend = cfg.mode;
+  if (cfg.mode === "auto") blend = lum > 128 ? "multiply" : "screen";
+
+  if (cfg.mode === "print") {
+    const lums = [];
+    for (let i = 0; i < data.length; i += 16) {
+      lums.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    }
+    lums.sort((a, b) => a - b);
+    const base = Math.max(40, lums[Math.floor(lums.length * 0.9)] || 255);
+
+    const shadeC = document.createElement("canvas");
+    shadeC.width = sw; shadeC.height = sh;
+    const sctx = shadeC.getContext("2d");
+    const sid = sctx.createImageData(sw, sh);
+    for (let i = 0; i < data.length; i += 4) {
+      const l = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      const v = Math.round(255 * Math.min(1, Math.max(0.35, l / base)));
+      sid.data[i] = v; sid.data[i + 1] = v; sid.data[i + 2] = v; sid.data[i + 3] = 255;
+    }
+    sctx.putImageData(sid, 0, 0);
+
+    const mask = document.createElement("canvas");
+    mask.width = ow; mask.height = oh;
+    mask.getContext("2d").drawImage(off, 0, 0);
+    octx.globalCompositeOperation = "multiply";
+    octx.drawImage(shadeC, 0, 0, ow, oh);
+    octx.globalCompositeOperation = "destination-in";
+    octx.drawImage(mask, 0, 0);
+    octx.globalCompositeOperation = "source-over";
+    blend = "source-over";
+  }
+
+  ctx.save();
+  ctx.globalAlpha = cfg.fade / 100;
+  ctx.globalCompositeOperation = blend;
+  ctx.drawImage(off, ox, oy, ow, oh);
+  ctx.restore();
+
+  return { canvas, fabric, box: { ox, oy, ow, oh, CW, CH } };
+}
+
+// crop the placement region (plus margin) out of a mockup for AI review
+function cropForReview(canvas, box) {
+  const mx = box.ow * 0.18, my = box.oh * 0.18;
+  const x = Math.max(0, box.ox - mx), y = Math.max(0, box.oy - my);
+  const w = Math.min(box.CW - x, box.ow + mx * 2);
+  const h = Math.min(box.CH - y, box.oh + my * 2);
+  const c = document.createElement("canvas");
+  const s = Math.min(1, 700 / Math.max(w, h));
+  c.width = Math.round(w * s); c.height = Math.round(h * s);
+  c.getContext("2d").drawImage(canvas, x, y, w, h, 0, 0, c.width, c.height);
+  return c.toDataURL("image/png").split(",")[1];
+}
+
 function LogoBlender() {
   const [shirt, setShirt] = useState(null);
   const [logo, setLogo] = useState(null);
-  const [pos, setPos] = useState({ x: 0.5, y: 0.4 }); // fraction of canvas
-  const [scale, setScale] = useState(30);   // % of canvas width
-  const [fade, setFade] = useState(85);     // opacity %
-  const [adapt, setAdapt] = useState(35);   // color adaptation toward fabric %
-  const [mode, setMode] = useState("auto");
-  const [bgKey, setBgKey] = useState(25); // background removal strength (0 = off)
+  const [pos, setPos] = useState({ x: 0.5, y: 0.4 });
+  const [scale, setScale] = useState(30);
+  const [fade, setFade] = useState(95);
+  const [adapt, setAdapt] = useState(0);
+  const [mode, setMode] = useState("print");
+  const [bgKey, setBgKey] = useState(25);
+  const [panel, setPanel] = useState({ on: false, hex: "#d6246e" });
   const [fabric, setFabric] = useState(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiNote, setAiNote] = useState(null);
   const canvasRef = useRef(null);
   const dragging = useRef(false);
 
-  const CW = 640;
+  const cfg = { fade, adapt, mode, bgKey, panel };
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !shirt) return;
-    const CH = Math.round(CW * (shirt.height / shirt.width));
-    canvas.width = CW; canvas.height = CH;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(shirt, 0, 0, CW, CH);
-
-    if (!logo) return;
-    const lw = (scale / 100) * CW;
-    const lh = lw * (logo.height / logo.width);
-    const lx = pos.x * CW - lw / 2;
-    const ly = pos.y * CH - lh / 2;
-
-    // sample fabric color under the placement region
-    const sx = Math.max(0, Math.round(lx)), sy = Math.max(0, Math.round(ly));
-    const sw = Math.min(CW - sx, Math.round(lw)) || 1;
-    const sh = Math.min(CH - sy, Math.round(lh)) || 1;
-    const data = ctx.getImageData(sx, sy, sw, sh).data;
-    let r = 0, g = 0, b = 0, n = 0;
-    for (let i = 0; i < data.length; i += 16) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
-    r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
-    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-    const hex = "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
-    setFabric({ hex, lum: Math.round(lum) });
-
-    // offscreen logo with color adaptation toward fabric
-    const off = document.createElement("canvas");
-    off.width = Math.max(1, Math.round(lw)); off.height = Math.max(1, Math.round(lh));
-    const octx = off.getContext("2d");
-    octx.drawImage(logo, 0, 0, off.width, off.height);
-
-    // key out the logo's own background (sampled from its corners) so
-    // non-transparent PNGs/JPGs don't print as a colored box
-    if (bgKey > 0) {
-      const id = octx.getImageData(0, 0, off.width, off.height);
-      const px = id.data;
-      const W = off.width, H = off.height;
-      // average the four corner patches to estimate the background color
-      let br = 0, bg2 = 0, bb = 0, bn = 0;
-      const patch = Math.max(1, Math.floor(Math.min(W, H) * 0.04));
-      const corners = [[0, 0], [W - patch, 0], [0, H - patch], [W - patch, H - patch]];
-      for (const [cx0, cy0] of corners) {
-        for (let y = cy0; y < cy0 + patch; y++) {
-          for (let x = cx0; x < cx0 + patch; x++) {
-            const i = (y * W + x) * 4;
-            if (px[i + 3] < 10) continue; // already transparent
-            br += px[i]; bg2 += px[i + 1]; bb += px[i + 2]; bn++;
-          }
-        }
-      }
-      if (bn > 0) {
-        br /= bn; bg2 /= bn; bb /= bn;
-        const tol = bgKey * 1.8;        // hard cutoff
-        const soft = tol * 1.7;         // soft edge falloff
-        for (let i = 0; i < px.length; i += 4) {
-          if (px[i + 3] === 0) continue;
-          const d = Math.sqrt(
-            (px[i] - br) ** 2 + (px[i + 1] - bg2) ** 2 + (px[i + 2] - bb) ** 2
-          );
-          if (d < tol) px[i + 3] = 0;
-          else if (d < soft) px[i + 3] = Math.round(px[i + 3] * ((d - tol) / (soft - tol)));
-        }
-        octx.putImageData(id, 0, 0);
-      }
+    if (!logo) {
+      const CH = Math.round(640 * (shirt.height / shirt.width));
+      canvas.width = 640; canvas.height = CH;
+      canvas.getContext("2d").drawImage(shirt, 0, 0, 640, CH);
+      return;
     }
-
-    if (adapt > 0) {
-      octx.globalCompositeOperation = "source-atop";
-      octx.fillStyle = `rgba(${r},${g},${b},${adapt / 100})`;
-      octx.fillRect(0, 0, off.width, off.height);
-      octx.globalCompositeOperation = "source-over";
-    }
-
-    let blend = mode;
-    if (mode === "auto") blend = lum > 128 ? "multiply" : "screen";
-    ctx.save();
-    ctx.globalAlpha = fade / 100;
-    ctx.globalCompositeOperation = blend;
-    ctx.drawImage(off, lx, ly, lw, lh);
-    ctx.restore();
-  }, [shirt, logo, pos, scale, fade, adapt, mode, bgKey]);
+    const out = compositeMockup(shirt, logo, pos, scale, cfg);
+    canvas.width = out.canvas.width; canvas.height = out.canvas.height;
+    canvas.getContext("2d").drawImage(out.canvas, 0, 0);
+    setFabric(out.fabric);
+  }, [shirt, logo, pos, scale, fade, adapt, mode, bgKey, panel]);
 
   useEffect(() => { render(); }, [render]);
+
+  // Agentic auto-fit: propose settings, render, have the AI inspect the
+  // actual result, and correct until every element is visible (max 2 rounds).
+  const autoFit = async () => {
+    if (!shirt || !logo) return;
+    setAiBusy(true); setAiNote("Analyzing design…");
+    try {
+      const logoB64 = imageToBase64(logo, 512);
+      const probe = compositeMockup(shirt, logo, pos, scale, { ...cfg, bgKey: 0, panel: { on: false, hex: panel.hex } });
+      const fab = probe.fabric;
+
+      // step 1: propose
+      const prop = await askClaude(
+        `You configure a t-shirt mockup compositor. The attached image is a customer's design file. It will print on fabric colored ${fab.hex} (luminance ${fab.lum}/255).
+
+Every element of the design must remain visible on that fabric. If the design contains light/white elements and the fabric is light (or dark elements on dark fabric), removing the background is NOT enough — you must add a backing panel in a color that contrasts the fabric and suits the design's own palette.
+
+Respond ONLY with valid JSON, no markdown:
+{"bgRemoval": 0-60 (0 = keep the design's own background), "addPanel": true|false, "panelHex": "#RRGGBB or null", "note": "one short sentence"}`,
+        logoB64
+      );
+      let trial = {
+        fade: 95, adapt: 0, mode: "print",
+        bgKey: Math.max(0, Math.min(60, Number(prop.bgRemoval) || 0)),
+        panel: { on: !!prop.addPanel, hex: prop.panelHex || "#d6246e" },
+      };
+      let note = prop.note || "";
+
+      // step 2: render, inspect, correct (up to 2 rounds)
+      for (let round = 0; round < 2; round++) {
+        setAiNote(`Checking result (pass ${round + 1})…`);
+        const out = compositeMockup(shirt, logo, pos, scale, trial);
+        const cropB64 = cropForReview(out.canvas, out.box);
+        const check = await askClaude(
+          `Image 1 is a customer's original design file. Image 2 is a crop of a t-shirt mockup where that design was printed onto fabric.
+
+Judge ONLY visibility and crispness: is EVERY element of the original design (all text, outlines, artwork) clearly visible and readable in the mockup, with no invisible, ghosted, or fringed parts?
+
+Respond ONLY with valid JSON, no markdown:
+{"ok": true|false, "problem": "short description or null", "fix": {"bgRemoval": 0-60, "addPanel": true|false, "panelHex": "#RRGGBB or null"}, "note": "one short sentence"}
+
+If any element is invisible or barely readable (e.g. white text on white fabric), ok must be false and fix.addPanel must be true with a panelHex that strongly contrasts the fabric and suits the design's palette.`,
+          [logoB64, cropB64]
+        );
+        note = check.note || note;
+        if (check.ok) break;
+        trial = {
+          ...trial,
+          bgKey: Math.max(0, Math.min(60, Number(check.fix?.bgRemoval) ?? trial.bgKey)),
+          panel: {
+            on: !!check.fix?.addPanel,
+            hex: check.fix?.panelHex || trial.panel.hex,
+          },
+        };
+      }
+
+      setBgKey(trial.bgKey);
+      setPanel(trial.panel);
+      setMode("print"); setAdapt(0); setFade(95);
+      setAiNote(note || "Settings applied.");
+    } catch (e) {
+      setAiNote(`Auto-fit failed: ${e.message}`);
+    }
+    setAiBusy(false);
+  };
 
   const toFrac = (e) => {
     const rect = canvasRef.current.getBoundingClientRect();
@@ -276,15 +432,35 @@ function LogoBlender() {
       <div className="space-y-4">
         <Drop label="Shirt photo" onFile={(img) => setShirt(img)} />
         <Drop label="Customer logo" onFile={(img) => setLogo(img)} />
+        <button onClick={autoFit} disabled={!shirt || !logo || aiBusy}
+          className="w-full py-2 rounded font-medium text-sm"
+          style={{ background: shirt && logo && !aiBusy ? T.cyan : T.line, color: "#fff" }}>
+          {aiBusy ? "Working…" : "✦ AI auto-fit"}
+        </button>
+        {aiNote && (
+          <div className="text-xs rounded p-2" style={{ fontFamily: mono, color: T.inkSoft, background: T.card, border: `1px solid ${T.line}` }}>
+            {aiNote}
+          </div>
+        )}
         <div className="rounded-lg p-4 space-y-4" style={{ background: T.card, border: `1px solid ${T.line}` }}>
           <Slider label="LOGO SIZE %" value={scale} onChange={setScale} min={5} max={80} />
           <Slider label="BG REMOVAL (0 = off)" value={bgKey} onChange={setBgKey} min={0} max={60} />
           <Slider label="FADE / OPACITY" value={fade} onChange={setFade} min={10} max={100} />
-          <Slider label="COLOR ADAPT → FABRIC" value={adapt} onChange={setAdapt} />
+          <Slider label="VINTAGE TINT (0 = vivid print)" value={adapt} onChange={setAdapt} />
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ fontFamily: mono, color: T.inkSoft }}>
+              <input type="checkbox" checked={panel.on} style={{ accentColor: T.magenta }}
+                onChange={(e) => setPanel({ ...panel, on: e.target.checked })} />
+              BACKING PANEL
+            </label>
+            <input type="color" value={panel.hex} disabled={!panel.on}
+              onChange={(e) => setPanel({ ...panel, hex: e.target.value })}
+              style={{ width: 34, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: panel.on ? 1 : 0.4 }} />
+          </div>
           <div>
             <div className="text-xs mb-1" style={{ fontFamily: mono, color: T.inkSoft }}>BLEND MODE</div>
             <div className="flex flex-wrap gap-1.5">
-              {["auto", "multiply", "screen", "overlay", "source-over"].map((m) => (
+              {["print", "auto", "multiply", "screen", "overlay", "source-over"].map((m) => (
                 <button key={m} onClick={() => setMode(m)}
                   className="px-2 py-1 rounded text-xs"
                   style={{
@@ -301,7 +477,7 @@ function LogoBlender() {
           {fabric && (
             <div className="flex items-center gap-2 text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>
               <span style={{ display: "inline-block", width: 14, height: 14, background: fabric.hex, border: `1px solid ${T.line}`, borderRadius: 3 }} />
-              fabric {fabric.hex} · lum {fabric.lum} {mode === "auto" && `→ ${fabric.lum > 128 ? "multiply" : "screen"}`}
+              fabric {fabric.hex} · lum {fabric.lum}
             </div>
           )}
           <button onClick={download} disabled={!shirt || !logo}
@@ -332,7 +508,7 @@ function LogoBlender() {
           )}
         </div>
         <p className="text-xs mt-2" style={{ color: T.inkSoft }}>
-          Fabric color is sampled live under the logo. Auto blend picks multiply on light fabric and screen on dark, so shadows and fabric texture show through the print.
+          Auto-fit now verifies its own work: it composites the mockup, inspects the result against the original design, and corrects (e.g. adds a contrasting backing panel when white text would vanish on white fabric) before committing settings.
         </p>
       </div>
     </div>
@@ -469,7 +645,7 @@ Rules:
       }
       setVariants(out);
     } catch (e) {
-      setError("Analysis failed — try again or use a clearer photo.");
+      setError(`Analysis failed: ${e.message}`);
     }
     setLoading(false);
   };
@@ -497,7 +673,7 @@ Rules:
         <button onClick={analyze} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.cyan : T.line, color: "#fff" }}>
-          {loading ? "Generating…" : "Generate template options"}
+          {loading ? "Generating…" : "Generate 5 template options"}
         </button>
         {spec && (
           <>
@@ -618,7 +794,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
       );
       setReport(result);
     } catch (e) {
-      setError("Check failed — try again.");
+      setError(`Check failed: ${e.message}`);
     }
     setLoading(false);
   };
@@ -631,7 +807,7 @@ If nothing concerning is present, return riskLevel low with an empty flags array
         <button onClick={check} disabled={!img || loading}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: img && !loading ? T.ink : T.line, color: "#fff" }}>
-          {loading ? "Screening…" : "Run Copyright Screen"}
+          {loading ? "Screening…" : "Run IP screen"}
         </button>
         {error && <div className="text-sm" style={{ color: T.bad }}>{error}</div>}
       </div>
