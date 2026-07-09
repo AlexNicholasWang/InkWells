@@ -47,14 +47,16 @@ function imageToBase64(img, maxDim = 1024) {
 async function askClaude(prompt, images) {
   const content = [];
   const arr = Array.isArray(images) ? images : images ? [images] : [];
-  for (const b64 of arr) {
+  for (const im of arr) {
+    const data = typeof im === "string" ? im : im.data;
+    const media_type = typeof im === "string" ? "image/png" : (im.media_type || "image/png");
     content.push({
       type: "image",
-      source: { type: "base64", media_type: "image/png", data: b64 },
+      source: { type: "base64", media_type, data },
     });
   }
   content.push({ type: "text", text: prompt });
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -337,10 +339,13 @@ function cropForReview(canvas, box) {
   const w = Math.min(box.CW - x, box.ow + mx * 2);
   const h = Math.min(box.CH - y, box.oh + my * 2);
   const c = document.createElement("canvas");
-  const s = Math.min(1, 700 / Math.max(w, h));
+  const s = Math.min(1, 512 / Math.max(w, h));
   c.width = Math.round(w * s); c.height = Math.round(h * s);
-  c.getContext("2d").drawImage(canvas, x, y, w, h, 0, 0, c.width, c.height);
-  return c.toDataURL("image/png").split(",")[1];
+  const cctx = c.getContext("2d");
+  cctx.fillStyle = "#ffffff";
+  cctx.fillRect(0, 0, c.width, c.height); // JPEG has no alpha
+  cctx.drawImage(canvas, x, y, w, h, 0, 0, c.width, c.height);
+  return { data: c.toDataURL("image/jpeg", 0.8).split(",")[1], media_type: "image/jpeg" };
 }
 
 function LogoBlender() {
@@ -385,7 +390,7 @@ function LogoBlender() {
     if (!shirt || !logo) return;
     setAiBusy(true); setAiNote("Analyzing design…");
     try {
-      const logoB64 = imageToBase64(logo, 512);
+      const logoB64 = imageToBase64(logo, 448);
       const probe = compositeMockup(shirt, logo, pos, scale, { ...cfg, bgKey: 0, panel: { on: false, hex: panel.hex }, swaps: [] });
       const fab = probe.fabric;
 
