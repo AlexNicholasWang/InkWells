@@ -236,6 +236,28 @@ function compositeMockup(shirt, logo, pos, scale, cfg) {
     }
   }
 
+  // recolor invisible ink: shift pixels near cfg.recolor.from toward
+  // cfg.recolor.to, preserving luminance so anti-aliasing stays smooth
+  if (cfg.recolor && cfg.recolor.on) {
+    const rid = lctx.getImageData(0, 0, lw, lh);
+    const p2 = rid.data;
+    const [fr, fg, fb] = hexToRgb(cfg.recolor.from || "#ffffff");
+    const [tr, tg, tb] = hexToRgb(cfg.recolor.to || "#333333");
+    const fromLum = Math.max(30, 0.299 * fr + 0.587 * fg + 0.114 * fb);
+    for (let i = 0; i < p2.length; i += 4) {
+      if (p2[i + 3] < 8) continue;
+      const d = Math.sqrt((p2[i] - fr) ** 2 + (p2[i + 1] - fg) ** 2 + (p2[i + 2] - fb) ** 2);
+      const f = d < 60 ? 1 : d < 110 ? 1 - (d - 60) / 50 : 0;
+      if (f <= 0) continue;
+      const l = 0.299 * p2[i] + 0.587 * p2[i + 1] + 0.114 * p2[i + 2];
+      const ratio = Math.min(1.25, l / fromLum);
+      p2[i]     = p2[i]     * (1 - f) + Math.min(255, tr * ratio) * f;
+      p2[i + 1] = p2[i + 1] * (1 - f) + Math.min(255, tg * ratio) * f;
+      p2[i + 2] = p2[i + 2] * (1 - f) + Math.min(255, tb * ratio) * f;
+    }
+    lctx.putImageData(rid, 0, 0);
+  }
+
   // compose backing panel + logo
   const off = document.createElement("canvas");
   off.width = ow; off.height = oh;
@@ -323,13 +345,14 @@ function LogoBlender() {
   const [mode, setMode] = useState("print");
   const [bgKey, setBgKey] = useState(25);
   const [panel, setPanel] = useState({ on: false, hex: "#d6246e" });
+  const [recolor, setRecolor] = useState({ on: false, from: "#ffffff", to: "#c4256b" });
   const [fabric, setFabric] = useState(null);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNote, setAiNote] = useState(null);
   const canvasRef = useRef(null);
   const dragging = useRef(false);
 
-  const cfg = { fade, adapt, mode, bgKey, panel };
+  const cfg = { fade, adapt, mode, bgKey, panel, recolor };
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -344,7 +367,7 @@ function LogoBlender() {
     canvas.width = out.canvas.width; canvas.height = out.canvas.height;
     canvas.getContext("2d").drawImage(out.canvas, 0, 0);
     setFabric(out.fabric);
-  }, [shirt, logo, pos, scale, fade, adapt, mode, bgKey, panel]);
+  }, [shirt, logo, pos, scale, fade, adapt, mode, bgKey, panel, recolor]);
 
   useEffect(() => { render(); }, [render]);
 
@@ -355,23 +378,33 @@ function LogoBlender() {
     setAiBusy(true); setAiNote("Analyzing design…");
     try {
       const logoB64 = imageToBase64(logo, 512);
-      const probe = compositeMockup(shirt, logo, pos, scale, { ...cfg, bgKey: 0, panel: { on: false, hex: panel.hex } });
+      const probe = compositeMockup(shirt, logo, pos, scale, { ...cfg, bgKey: 0, panel: { on: false, hex: panel.hex }, recolor: { on: false } });
       const fab = probe.fabric;
 
       // step 1: propose
       const prop = await askClaude(
         `You configure a t-shirt mockup compositor. The attached image is a customer's design file. It will print on fabric colored ${fab.hex} (luminance ${fab.lum}/255).
 
-Every element of the design must remain visible on that fabric. If the design contains light/white elements and the fabric is light (or dark elements on dark fabric), removing the background is NOT enough — you must add a backing panel in a color that contrasts the fabric and suits the design's own palette.
+Every element of the design must remain visible on that fabric, and the result should look like it belongs on this shirt.
+
+Your tools, in order of preference:
+1. bgRemoval: strip an incidental backdrop (0 = keep the design's own background).
+2. recolor: if some ink would be invisible against this fabric (e.g. white text on a white shirt), recolor exactly that ink: "from" = the invisible color, "to" = a replacement that clearly contrasts the fabric AND harmonizes with the design's own palette (prefer a color already present in the design, like an outline or accent color).
+3. addPanel: only as a last resort for complex multi-tone designs that recoloring would ruin.
 
 Respond ONLY with valid JSON, no markdown:
-{"bgRemoval": 0-60 (0 = keep the design's own background), "addPanel": true|false, "panelHex": "#RRGGBB or null", "note": "one short sentence"}`,
+{"bgRemoval": 0-60, "recolor": {"on": true|false, "from": "#RRGGBB", "to": "#RRGGBB"}, "addPanel": true|false, "panelHex": "#RRGGBB or null", "note": "one short sentence"}`,
         logoB64
       );
       let trial = {
         fade: 95, adapt: 0, mode: "print",
         bgKey: Math.max(0, Math.min(60, Number(prop.bgRemoval) || 0)),
         panel: { on: !!prop.addPanel, hex: prop.panelHex || "#d6246e" },
+        recolor: {
+          on: !!prop.recolor?.on,
+          from: prop.recolor?.from || "#ffffff",
+          to: prop.recolor?.to || "#c4256b",
+        },
       };
       let note = prop.note || "";
 
@@ -386,9 +419,9 @@ Respond ONLY with valid JSON, no markdown:
 Judge ONLY visibility and crispness: is EVERY element of the original design (all text, outlines, artwork) clearly visible and readable in the mockup, with no invisible, ghosted, or fringed parts?
 
 Respond ONLY with valid JSON, no markdown:
-{"ok": true|false, "problem": "short description or null", "fix": {"bgRemoval": 0-60, "addPanel": true|false, "panelHex": "#RRGGBB or null"}, "note": "one short sentence"}
+{"ok": true|false, "problem": "short description or null", "fix": {"bgRemoval": 0-60, "recolor": {"on": true|false, "from": "#RRGGBB", "to": "#RRGGBB"}, "addPanel": true|false, "panelHex": "#RRGGBB or null"}, "note": "one short sentence"}
 
-If any element is invisible or barely readable (e.g. white text on white fabric), ok must be false and fix.addPanel must be true with a panelHex that strongly contrasts the fabric and suits the design's palette.`,
+If any element is invisible or barely readable (e.g. white text on white fabric), ok must be false. Prefer fix.recolor: set "from" to the invisible ink's color and "to" to a color that clearly contrasts the fabric and harmonizes with the design's palette. Use fix.addPanel only if recoloring would ruin the design.`,
           [logoB64, cropB64]
         );
         note = check.note || note;
@@ -400,11 +433,17 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
             on: !!check.fix?.addPanel,
             hex: check.fix?.panelHex || trial.panel.hex,
           },
+          recolor: {
+            on: !!check.fix?.recolor?.on,
+            from: check.fix?.recolor?.from || trial.recolor.from,
+            to: check.fix?.recolor?.to || trial.recolor.to,
+          },
         };
       }
 
       setBgKey(trial.bgKey);
       setPanel(trial.panel);
+      setRecolor(trial.recolor);
       setMode("print"); setAdapt(0); setFade(95);
       setAiNote(note || "Settings applied.");
     } catch (e) {
@@ -435,7 +474,7 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
         <button onClick={autoFit} disabled={!shirt || !logo || aiBusy}
           className="w-full py-2 rounded font-medium text-sm"
           style={{ background: shirt && logo && !aiBusy ? T.cyan : T.line, color: "#fff" }}>
-          {aiBusy ? "Working…" : "✦ AI auto-fit"}
+          {aiBusy ? "Working…" : "✦ AI auto-fit (checks its own result)"}
         </button>
         {aiNote && (
           <div className="text-xs rounded p-2" style={{ fontFamily: mono, color: T.inkSoft, background: T.card, border: `1px solid ${T.line}` }}>
@@ -456,6 +495,22 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
             <input type="color" value={panel.hex} disabled={!panel.on}
               onChange={(e) => setPanel({ ...panel, hex: e.target.value })}
               style={{ width: 34, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: panel.on ? 1 : 0.4 }} />
+          </div>
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ fontFamily: mono, color: T.inkSoft }}>
+              <input type="checkbox" checked={recolor.on} style={{ accentColor: T.magenta }}
+                onChange={(e) => setRecolor({ ...recolor, on: e.target.checked })} />
+              INK RECOLOR
+            </label>
+            <div className="flex items-center gap-1">
+              <input type="color" value={recolor.from} disabled={!recolor.on}
+                onChange={(e) => setRecolor({ ...recolor, from: e.target.value })}
+                style={{ width: 28, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: recolor.on ? 1 : 0.4 }} />
+              <span className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>→</span>
+              <input type="color" value={recolor.to} disabled={!recolor.on}
+                onChange={(e) => setRecolor({ ...recolor, to: e.target.value })}
+                style={{ width: 28, height: 24, border: `1px solid ${T.line}`, borderRadius: 4, background: "transparent", opacity: recolor.on ? 1 : 0.4 }} />
+            </div>
           </div>
           <div>
             <div className="text-xs mb-1" style={{ fontFamily: mono, color: T.inkSoft }}>BLEND MODE</div>
@@ -508,7 +563,7 @@ If any element is invisible or barely readable (e.g. white text on white fabric)
           )}
         </div>
         <p className="text-xs mt-2" style={{ color: T.inkSoft }}>
-          Auto-fit now verifies its own work: it composites the mockup, inspects the result against the original design, and corrects (e.g. adds a contrasting backing panel when white text would vanish on white fabric) before committing settings.
+          Auto-fit verifies its own work: it composites the mockup, inspects the result against the original design, and corrects — preferring to recolor invisible ink into a shade that matches the shirt and the design's own palette, with a backing panel only as a last resort.
         </p>
       </div>
     </div>
