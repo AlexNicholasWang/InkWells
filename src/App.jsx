@@ -167,37 +167,58 @@ function Spinner({ text }) {
   );
 }
 
+
+// ---------- built-in shirts ----------
+// The shop offers exactly two garments: a plain black tee and a plain white
+// tee. Drawn flat and simple — no assets needed.
+const shirtCache = {};
+function makeShirt(kind) {
+  if (shirtCache[kind]) return shirtCache[kind];
+  const W = 900, H = 1040;
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const x = c.getContext("2d");
+  const dark = kind === "black";
+
+  // flat backdrop
+  x.fillStyle = dark ? "#EAE8E2" : "#D7D4CD";
+  x.fillRect(0, 0, W, H);
+
+  // flat tee silhouette
+  x.beginPath();
+  x.moveTo(330, 152);
+  x.quadraticCurveTo(450, 122, 570, 152);
+  x.lineTo(700, 196);
+  x.lineTo(802, 362);
+  x.lineTo(676, 410);
+  x.lineTo(648, 332);
+  x.lineTo(655, 948);
+  x.lineTo(245, 948);
+  x.lineTo(252, 332);
+  x.lineTo(224, 410);
+  x.lineTo(98, 362);
+  x.lineTo(200, 196);
+  x.closePath();
+  x.fillStyle = dark ? "#1B1C21" : "#F6F5F1";
+  x.fill();
+  // light outline so the white tee reads against the backdrop
+  x.strokeStyle = dark ? "#1B1C21" : "#C9C6BF";
+  x.lineWidth = 3;
+  x.stroke();
+
+  // simple collar
+  x.fillStyle = dark ? "#0E0F13" : "#E2E0DA";
+  x.beginPath(); x.ellipse(450, 156, 116, 38, 0, 0, Math.PI); x.fill();
+
+  shirtCache[kind] = c;
+  return c;
+}
+
 // ---------- Module 1: Logo Blender ----------
-// Pure compositor: renders shirt + logo with the given config into a canvas.
-// Used by both the live preview and the AI agent's trial renders.
-function compositeMockup(shirt, logo, pos, scale, cfg) {
-  const CW = 640;
-  const CH = Math.round(CW * (shirt.height / shirt.width));
-  const canvas = document.createElement("canvas");
-  canvas.width = CW; canvas.height = CH;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(shirt, 0, 0, CW, CH);
-
-  const lw = Math.max(2, Math.round((scale / 100) * CW));
-  const lh = Math.max(2, Math.round(lw * (logo.height / logo.width)));
-  const pp = cfg.panel.on ? Math.round(lw * 0.1) : 0;
-  const ow = lw + pp * 2, oh = lh + pp * 2;
-  const ox = pos.x * CW - ow / 2;
-  const oy = pos.y * CH - oh / 2;
-
-  const sx = Math.max(0, Math.round(ox)), sy = Math.max(0, Math.round(oy));
-  const sw = Math.min(CW - sx, ow) || 1;
-  const sh = Math.min(CH - sy, oh) || 1;
-  const data = ctx.getImageData(sx, sy, sw, sh).data;
-  let r = 0, g = 0, b = 0, n = 0;
-  for (let i = 0; i < data.length; i += 16) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
-  r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
-  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-  const fabric = {
-    hex: "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join(""),
-    lum: Math.round(lum),
-  };
-
+// Render the logo at (lw x lh) with background keying, de-fringing and the
+// colorway remap applied — transparent everywhere else. Shared by the mockup
+// compositor and the print-file download.
+function buildLogoArt(logo, lw, lh, cfg) {
   // key the logo's background with de-fringing
   const logoC = document.createElement("canvas");
   logoC.width = lw; logoC.height = lh;
@@ -267,6 +288,40 @@ function compositeMockup(shirt, logo, pos, scale, cfg) {
     }
     lctx.putImageData(rid, 0, 0);
   }
+  return logoC;
+}
+
+// Pure compositor: renders shirt + logo with the given config into a canvas.
+// Used by both the live preview and the AI agent's trial renders.
+function compositeMockup(shirt, logo, pos, scale, cfg) {
+  const CW = 640;
+  const CH = Math.round(CW * (shirt.height / shirt.width));
+  const canvas = document.createElement("canvas");
+  canvas.width = CW; canvas.height = CH;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(shirt, 0, 0, CW, CH);
+
+  const lw = Math.max(2, Math.round((scale / 100) * CW));
+  const lh = Math.max(2, Math.round(lw * (logo.height / logo.width)));
+  const pp = cfg.panel.on ? Math.round(lw * 0.1) : 0;
+  const ow = lw + pp * 2, oh = lh + pp * 2;
+  const ox = pos.x * CW - ow / 2;
+  const oy = pos.y * CH - oh / 2;
+
+  const sx = Math.max(0, Math.round(ox)), sy = Math.max(0, Math.round(oy));
+  const sw = Math.min(CW - sx, ow) || 1;
+  const sh = Math.min(CH - sy, oh) || 1;
+  const data = ctx.getImageData(sx, sy, sw, sh).data;
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < data.length; i += 16) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+  r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
+  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+  const fabric = {
+    hex: "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join(""),
+    lum: Math.round(lum),
+  };
+
+  const logoC = buildLogoArt(logo, lw, lh, cfg);
 
   // compose backing panel + logo
   const off = document.createElement("canvas");
@@ -350,6 +405,7 @@ function cropForReview(canvas, box) {
 
 function LogoBlender() {
   const [shirt, setShirt] = useState(null);
+  const [shirtKind, setShirtKind] = useState(null); // "white" | "black"
   const [logo, setLogo] = useState(null);
   const [pos, setPos] = useState({ x: 0.5, y: 0.4 });
   const [scale, setScale] = useState(30);
@@ -470,17 +526,59 @@ Judge like a print designer: the design should sit naturally on the fabric (back
     return { x: Math.min(1, Math.max(0, cx / rect.width)), y: Math.min(1, Math.max(0, cy / rect.height)) };
   };
 
-  const download = () => {
+  // Export the blended logo alone (background keyed, colorway remap and
+  // backing panel applied) as a high-res transparent PNG — the file the shop
+  // prints and heat-presses onto the shirt.
+  const downloadPrintFile = () => {
+    if (!logo) return;
+    const s = Math.min(1, 2000 / Math.max(logo.width, logo.height));
+    const lw = Math.max(2, Math.round(logo.width * s));
+    const lh = Math.max(2, Math.round(logo.height * s));
+    const art = buildLogoArt(logo, lw, lh, cfg);
+    const pp = panel.on ? Math.round(lw * 0.1) : 0;
+    const out = document.createElement("canvas");
+    out.width = lw + pp * 2; out.height = lh + pp * 2;
+    const octx = out.getContext("2d");
+    if (panel.on) {
+      octx.fillStyle = panel.hex;
+      if (typeof octx.roundRect === "function") {
+        octx.beginPath();
+        octx.roundRect(0, 0, out.width, out.height, Math.max(2, Math.round(pp * 0.7)));
+        octx.fill();
+      } else {
+        octx.fillRect(0, 0, out.width, out.height);
+      }
+    }
+    octx.drawImage(art, pp, pp);
     const a = document.createElement("a");
-    a.download = "mockup.png";
-    a.href = canvasRef.current.toDataURL("image/png");
+    a.download = `inkwells-print-${shirtKind || "shirt"}.png`;
+    a.href = out.toDataURL("image/png");
     a.click();
   };
 
   return (
     <div className="grid gap-5 md:grid-cols-3">
       <div className="space-y-4">
-        <Drop label="Shirt photo" onFile={(img) => setShirt(img)} />
+        <div className="rounded-lg p-3 space-y-2" style={{ background: T.card, border: `1px solid ${T.line}` }}>
+          <div className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>SHIRT — two options</div>
+          <div className="grid grid-cols-2 gap-2">
+            {[
+              { kind: "white", label: "Plain white", bg: "#F6F5F1", fg: T.ink },
+              { kind: "black", label: "Plain black", bg: "#1B1C21", fg: "#FFFFFF" },
+            ].map((o) => (
+              <button key={o.kind}
+                onClick={() => { setShirtKind(o.kind); setShirt(makeShirt(o.kind)); }}
+                className="rounded p-3 text-sm font-medium"
+                style={{
+                  background: o.bg, color: o.fg,
+                  border: `2px solid ${shirtKind === o.kind ? T.magenta : T.line}`,
+                  boxShadow: shirtKind === o.kind ? `0 0 0 2px ${T.magenta}33` : "none",
+                }}>
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </div>
         <Drop label="Customer logo" onFile={(img) => setLogo(img)} />
         <button onClick={autoFit} disabled={!shirt || !logo || aiBusy}
           className="w-full py-2 rounded font-medium text-sm"
@@ -555,11 +653,14 @@ Judge like a print designer: the design should sit naturally on the fabric (back
               fabric {fabric.hex} · lum {fabric.lum}
             </div>
           )}
-          <button onClick={download} disabled={!shirt || !logo}
+          <button onClick={downloadPrintFile} disabled={!logo}
             className="w-full py-2 rounded font-medium text-sm"
-            style={{ background: shirt && logo ? T.magenta : T.line, color: "#fff" }}>
-            Download mockup PNG
+            style={{ background: logo ? T.magenta : T.line, color: "#fff" }}>
+            Download print file (blended logo PNG)
           </button>
+          <p className="text-xs" style={{ fontFamily: mono, color: T.inkSoft }}>
+            Transparent high-res PNG of the adjusted logo — print it and press it onto the shirt.
+          </p>
         </div>
       </div>
       <div className="md:col-span-2">
@@ -578,7 +679,7 @@ Judge like a print designer: the design should sit naturally on the fabric (back
             />
           ) : (
             <div className="flex items-center justify-center text-sm" style={{ height: 380, color: T.inkSoft, fontFamily: mono }}>
-              Upload a shirt photo to start — drag on the canvas to place the logo
+              Pick a shirt — plain white or plain black — then drag on the canvas to place the logo
             </div>
           )}
         </div>
