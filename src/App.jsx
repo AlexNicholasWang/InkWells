@@ -2,13 +2,13 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 
 // ---------- design tokens ----------
 const T = {
-  paper: "#F7F6F2",
-  ink: "#16202E",
-  inkSoft: "#4A5568",
-  line: "#DDD9CE",
-  magenta: "#C4256B",
-  cyan: "#0E8CA8",
-  yellowChip: "#E8B931",
+  paper: "#F4F1EB",
+  ink: "#151515",
+  inkSoft: "#65615B",
+  line: "#D7D1C7",
+  magenta: "#E54B7B",
+  cyan: "#188B91",
+  yellowChip: "#E0A82E",
   card: "#FFFFFF",
   ok: "#2F855A",
   warn: "#B7791F",
@@ -1039,7 +1039,7 @@ const TABS = [
   { id: "ip", label: "Copyright Screen", chip: T.yellowChip, sub: "flag copyrighted logos" },
 ];
 
-export default function App() {
+function LegacyApp() {
   const [tab, setTab] = useState("blend");
   return (
     <div className="min-h-screen" style={{ background: T.paper, fontFamily: sans, color: T.ink }}>
@@ -1073,4 +1073,32 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+const PRODUCT_TABS = [
+  { id: "blend", label: "Logo Blender", chip: T.magenta, sub: "Place artwork naturally on fabric", number: "01" },
+  { id: "template", label: "Template Extractor", chip: T.cyan, sub: "Turn samples into reusable forms", number: "02" },
+  { id: "ip", label: "IP Screen", chip: T.yellowChip, sub: "Flag risky artwork before print", number: "03" },
+];
+
+function Home({ openTool }) {
+  return <>
+    <section className="iw-hero"><div className="iw-hero-copy"><div className="iw-kicker">Creative operations for custom apparel</div><h1>From rough artwork to <em>press-ready confidence.</em></h1><p>InkWells brings mockup preparation, template extraction, and first-pass IP screening into one focused production workspace.</p><div className="iw-actions"><button className="iw-primary" onClick={() => openTool("blend")}>Start a design <span>↗</span></button><a href="#workflow">See the workflow <span>↓</span></a></div></div><div className="iw-hero-art" aria-label="InkWells production workflow preview"><div className="iw-art-grid"></div><div className="iw-shirt"><span>INK<br/>WELLS</span></div><div className="iw-float-card top"><small>ARTWORK FIT</small><strong>98%</strong><span>Production ready</span></div><div className="iw-float-card bottom"><i></i><span><small>COLORWAY</small><strong>Carbon / Rose</strong></span></div></div></section>
+    <section className="iw-statement"><span>Built for the space between</span><strong>creative intent</strong><i>and</i><strong>production reality.</strong></section>
+    <section className="iw-workflow" id="workflow"><div className="iw-section-head"><div><span className="iw-kicker">One connected workflow</span><h2>Three production problems.<br/>One clear place to solve them.</h2></div><p>Move from customer upload to a more informed production decision without stitching together a stack of disconnected tools.</p></div><div className="iw-tool-cards">{PRODUCT_TABS.map((tool) => <button key={tool.id} onClick={() => openTool(tool.id)}><span className="iw-number">{tool.number}</span><i style={{background:tool.chip}}></i><h3>{tool.label}</h3><p>{tool.sub}</p><b>Open tool →</b></button>)}</div></section>
+    <section className="iw-dark-band"><span className="iw-kicker">Made for print teams</span><h2>Keep creative work moving<br/>without losing the details.</h2><button className="iw-primary" onClick={() => openTool("blend")}>Enter the studio</button></section>
+  </>;
+}
+
+export default function App() {
+  const initial = new URLSearchParams(window.location.search).get("tool") || "home";
+  const [tab, setTab] = useState(initial);
+  const openTool = (id) => { setTab(id); window.history.pushState({}, "", id === "home" ? window.location.pathname : `${window.location.pathname}?tool=${id}`); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  useEffect(() => { const sync = () => setTab(new URLSearchParams(window.location.search).get("tool") || "home"); window.addEventListener("popstate", sync); return () => window.removeEventListener("popstate", sync); }, []);
+  const active = PRODUCT_TABS.find((item) => item.id === tab);
+  return <div className="min-h-screen iw-app" style={{ background: T.paper, fontFamily: sans, color: T.ink }}>
+    <header className="iw-header"><button className="iw-brand" onClick={() => openTool("home")}><span className="iw-mark"><i></i><i></i><i></i></span><strong>InkWells</strong><small>Print Intelligence</small></button><nav>{PRODUCT_TABS.map((t) => <button key={t.id} className={tab === t.id ? "active" : ""} onClick={() => openTool(t.id)}>{t.label}</button>)}</nav><button className="iw-studio-btn" onClick={() => openTool("blend")}>Open studio <span>↗</span></button></header>
+    <main>{tab === "home" ? <Home openTool={openTool} /> : <><section className="iw-tool-hero"><div><span className="iw-kicker">Tool {active?.number} / 03</span><h1>{active?.label}</h1><p>{active?.sub}. Upload your source artwork below to begin.</p></div><span className="iw-tool-chip" style={{background:active?.chip}}></span></section><div className="iw-tool-shell">{tab === "blend" && <LogoBlender />}{tab === "template" && <TemplateExtractor />}{tab === "ip" && <CopyrightChecker />}</div></>}</main>
+    <footer className="iw-footer"><button className="iw-brand light" onClick={() => openTool("home")}><span className="iw-mark"><i></i><i></i><i></i></span><strong>InkWells</strong></button><p>Creative operations for better custom apparel.</p><span>© 2026 InkWells</span></footer>
+  </div>;
 }
