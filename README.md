@@ -1,4 +1,4 @@
-# InkWells
+# Speeder Solutions LLC (InkWells Project)
 
 Logo blending, template extraction, and IP screening for custom apparel.
 
